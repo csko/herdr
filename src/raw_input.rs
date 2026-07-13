@@ -324,21 +324,30 @@ impl RawInputByteFramer {
             return chunks;
         }
 
-        if self.buffer.as_slice() == [ESC] {
-            if self.host_color_replies_awaited > 0 && !self.held_pending_color_esc {
+        if !self.buffer.is_empty() && self.buffer.iter().all(|byte| *byte == ESC) {
+            // Lone trailing ESC may be a split OSC color-reply introducer; hold one flush.
+            if self.buffer.len() == 1
+                && self.host_color_replies_awaited > 0
+                && !self.held_pending_color_esc
+            {
                 self.held_pending_color_esc = true;
                 tracing::trace!("holding lone escape one flush while awaiting host color reply");
                 return chunks;
             }
-            // No continuation arrived; give up the window so Escape is not delayed again.
+            // Timed out: a run of ESCs is rapid standalone presses, not an Alt
+            // chord. Emit one Escape per byte instead of dropping the run.
             self.host_color_replies_awaited = 0;
             self.held_pending_color_esc = false;
             tracing::warn!(
-                bytes = ?self.buffer,
-                "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
+                count = self.buffer.len(),
+                "flushing escape run after input timeout as standalone Escape key(s)"
             );
             self.lone_escape_recently_flushed = true;
-            chunks.push(std::mem::take(&mut self.buffer));
+            let count = self.buffer.len();
+            self.buffer.clear();
+            for _ in 0..count {
+                chunks.push(vec![ESC]);
+            }
             return chunks;
         }
 
@@ -773,6 +782,13 @@ fn complete_escape_sequence_len(buffer: &[u8]) -> Option<usize> {
                 return Some(1);
             }
         }
+    }
+
+    // Rapid Escape presses: trailing ESCs cannot complete an Alt chord for the
+    // leading ESC, so peel it as a standalone Escape. The `\x1b\x1b` recursion
+    // below still keeps real Alt chords (Alt+Up = `\x1b\x1b[A`).
+    if buffer.starts_with(b"\x1b\x1b\x1b") {
+        return Some(1);
     }
 
     if buffer.starts_with(b"\x1b\x1b") {
@@ -2422,5 +2438,24 @@ mod tests {
         // Window closed: a later lone Escape flushes immediately.
         assert!(framer.push(b"\x1b").is_empty());
         assert_eq!(framer.flush_timeout(), vec![b"\x1b".to_vec()]);
+    }
+
+    #[test]
+    fn escape_run_emits_one_escape_per_press() {
+        for (bytes, count) in [(b"\x1b\x1b".as_slice(), 2usize), (b"\x1b\x1b\x1b", 3)] {
+            let events = parse_raw_input_bytes_sync(bytes);
+            assert_eq!(events.len(), count, "bytes: {bytes:?}");
+            for event in events {
+                assert_raw_key(event, KeyCode::Esc, KeyModifiers::empty());
+            }
+        }
+    }
+
+    #[test]
+    fn escape_run_flushes_as_individual_bare_escape_chunks() {
+        let mut framer = RawInputByteFramer::default();
+        assert!(framer.push(b"\x1b").is_empty());
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout(), vec![vec![ESC], vec![ESC]]);
     }
 }
